@@ -11,15 +11,20 @@ linters:
     - staticcheck
     - gosec
     - ineffassign
-    - gofmt
-    - goimports
     - errorlint
     - noctx
   settings:
-    goimports:
-      local-prefixes: github.com/ixofoundation/vault-argocd-watcher
     gosec:
       severity: medium
   exclusions:
     presets:
       - common-false-positives
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/ixofoundation/vault-argocd-watcher
