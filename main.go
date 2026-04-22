@@ -11,6 +11,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -79,11 +80,16 @@ func vaultLogin(cfg config) (token string, leaseSecs int, err error) {
 		"role": cfg.vaultRole,
 	})
 
-	resp, err := http.Post(cfg.vaultAddr+"/v1/auth/kubernetes/login", "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, cfg.vaultAddr+"/v1/auth/kubernetes/login", bytes.NewReader(body))
+	if err != nil {
+		return "", 0, fmt.Errorf("vault login new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("vault login request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resp.Body)
@@ -98,13 +104,16 @@ func vaultLogin(cfg config) (token string, leaseSecs int, err error) {
 }
 
 func vaultRenewSelf(cfg config, token string) error {
-	req, _ := http.NewRequest(http.MethodPost, cfg.vaultAddr+"/v1/auth/token/renew-self", nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, cfg.vaultAddr+"/v1/auth/token/renew-self", nil)
+	if err != nil {
+		return fmt.Errorf("renew-self new request: %w", err)
+	}
 	req.Header.Set("X-Vault-Token", token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("renew-self returned %d", resp.StatusCode)
 	}
@@ -173,7 +182,7 @@ func watchEvents(cfg config, token string, appMapping map[string]string) error {
 	if err != nil {
 		return fmt.Errorf("websocket dial: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	slog.Info("connected to vault event stream", "url", u.String())
 
 	for {
@@ -236,7 +245,7 @@ func hardRefresh(cfg config, appName string) error {
 	)
 	patch := `{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}`
 
-	req, err := http.NewRequest(http.MethodPatch, patchURL, strings.NewReader(patch))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPatch, patchURL, strings.NewReader(patch))
 	if err != nil {
 		return err
 	}
@@ -247,7 +256,7 @@ func hardRefresh(cfg config, appName string) error {
 	if err != nil {
 		return fmt.Errorf("k8s patch request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
