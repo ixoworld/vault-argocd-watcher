@@ -1,0 +1,11 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "vault-argocd-watcher.fullname" . }}
+  labels:
+    {{- include "vault-argocd-watcher.labels" . | nindent 4 }}
+rules:
+  # Patch the hard-refresh annotation on ArgoCD Application resources.
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "patch"]

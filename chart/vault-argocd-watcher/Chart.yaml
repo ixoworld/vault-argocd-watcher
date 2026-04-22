@@ -1,0 +1,16 @@
+apiVersion: v2
+name: vault-argocd-watcher
+description: >
+  Watches HashiCorp Vault KV v2 write events via WebSocket and triggers an
+  ArgoCD hard refresh on affected applications, so that ArgoCD Vault Plugin
+  (AVP) re-fetches updated secrets without manual intervention.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - vault
+  - argocd
+  - gitops
+  - secrets
+sources:
+  - https://github.com/ixofoundation/vault-argocd-watcher

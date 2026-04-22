@@ -1,0 +1,39 @@
+# Default values for vault-argocd-watcher.
+# All values here are generic — override with your own values.yaml or
+# via --set when deploying. No cluster-specific defaults are assumed.
+
+image:
+  repository: ghcr.io/ixofoundation/vault-argocd-watcher
+  # Defaults to Chart.appVersion when empty.
+  tag: ""
+  pullPolicy: Always
+
+vault:
+  # Address of the Vault server reachable from inside the cluster.
+  addr: "http://vault-active.vault.svc.cluster.local:8200"
+  # Kubernetes auth role configured in Vault for this service account.
+  role: "vault-watcher"
+  # KV v2 mount path (e.g. "secret" or "ixo_core").
+  mount: "secret"
+
+argocd:
+  # Namespace where ArgoCD Application resources live.
+  namespace: "argocd"
+
+# List of ArgoCD application names to watch.
+# Each entry maps to the Vault path: {vault.mount}/data/{app-name}
+# When a secret at that path is updated, the corresponding ArgoCD
+# Application is hard-refreshed so AVP re-renders with the new value.
+#
+# Example:
+#   watchedApps:
+#     - my-api
+#     - my-worker
+watchedApps: []
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 64Mi
