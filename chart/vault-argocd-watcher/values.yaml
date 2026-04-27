@@ -3,7 +3,7 @@
 # via --set when deploying. No cluster-specific defaults are assumed.
 
 image:
-  repository: ghcr.io/ixofoundation/vault-argocd-watcher
+  repository: ghcr.io/ixoworld/vault-argocd-watcher
   # Defaults to Chart.appVersion when empty.
   tag: ""
   pullPolicy: Always
