@@ -173,8 +173,9 @@ func watchEvents(cfg config, token string, appMapping map[string]string) error {
 	case "https":
 		u.Scheme = "wss"
 	}
-	// Subscribe to KV v2 data-write and data-patch events.
-	u.Path = "/v1/sys/events/subscribe/kv-v2/data-write,kv-v2/data-patch"
+	// Subscribe to all KV v2 data events (write + patch) via glob.
+	// Comma-separated types in the path are not supported; one pattern per connection.
+	u.Path = "/v1/sys/events/subscribe/kv-v2/data-*"
 	u.RawQuery = "json=true"
 
 	header := http.Header{"X-Vault-Token": {token}}
