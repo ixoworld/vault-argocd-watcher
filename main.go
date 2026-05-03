@@ -178,8 +178,11 @@ func watchEvents(cfg config, token string, appMapping map[string]string) error {
 	u.RawQuery = "json=true"
 
 	header := http.Header{"X-Vault-Token": {token}}
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+	conn, resp, err := websocket.DefaultDialer.Dial(u.String(), header)
 	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("websocket dial (HTTP %d): %w", resp.StatusCode, err)
+		}
 		return fmt.Errorf("websocket dial: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
