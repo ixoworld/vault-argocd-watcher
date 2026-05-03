@@ -45,3 +45,5 @@ spec:
               value: {{ .Values.argocd.namespace | quote }}
             - name: WATCHED_APPS
               value: {{ .Values.watchedApps | join "," | quote }}
+            - name: POLL_INTERVAL
+              value: {{ .Values.vault.pollInterval | quote }}

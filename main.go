@@ -1,11 +1,11 @@
-// vault-argocd-watcher watches Vault KV v2 write events via WebSocket and
+// vault-argocd-watcher polls Vault KV v2 secret metadata for version changes and
 // triggers a hard refresh on the corresponding ArgoCD Application so that
 // ArgoCD Vault Plugin (AVP) re-fetches the updated secret on the next render.
 //
 // Auth flow:
 //   - Authenticates to Vault using the pod's Kubernetes service account token
-//   - Connects to Vault's event WebSocket endpoint (Vault OSS 1.16+)
-//   - On secret write event, patches the ArgoCD Application annotation using
+//   - Polls GET /<mount>/metadata/<app> for each watched app on a configurable interval
+//   - On version increment, patches the ArgoCD Application annotation using
 //     the in-cluster Kubernetes API (no ArgoCD token needed)
 package main
 
@@ -19,12 +19,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -38,6 +35,7 @@ type config struct {
 	k8sCACertPath string
 	argoNamespace string
 	watchedApps   []string
+	pollInterval  time.Duration
 }
 
 func loadConfig() config {
@@ -46,6 +44,12 @@ func loadConfig() config {
 	for _, a := range strings.Split(appsRaw, ",") {
 		if s := strings.TrimSpace(a); s != "" {
 			apps = append(apps, s)
+		}
+	}
+	pollInterval := 30 * time.Second
+	if s := os.Getenv("POLL_INTERVAL"); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d >= 5*time.Second {
+			pollInterval = d
 		}
 	}
 	return config{
@@ -57,6 +61,7 @@ func loadConfig() config {
 		k8sCACertPath: getEnv("K8S_CA_CERT_PATH", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
 		argoNamespace: getEnv("ARGO_NAMESPACE", "app-argocd"),
 		watchedApps:   apps,
+		pollInterval:  pollInterval,
 	}
 }
 
@@ -131,7 +136,7 @@ func scheduleTokenRenewal(cfg config, token string, leaseSecs int) {
 		defer ticker.Stop()
 		for range ticker.C {
 			if err := vaultRenewSelf(cfg, token); err != nil {
-				slog.Warn("token renewal failed — will re-authenticate on reconnect", "error", err)
+				slog.Warn("token renewal failed", "error", err)
 			} else {
 				slog.Info("vault token renewed", "next_in", interval)
 			}
@@ -139,83 +144,86 @@ func scheduleTokenRenewal(cfg config, token string, leaseSecs int) {
 	}()
 }
 
-// ── Vault event WebSocket ─────────────────────────────────────────────────────
+// ── Vault KV v2 metadata polling ──────────────────────────────────────────────
 
-// vaultEvent is the CloudEvents envelope Vault emits for KV v2 changes.
-type vaultEvent struct {
-	Type string `json:"type"`
+type kvMetadataResp struct {
 	Data struct {
-		Event struct {
-			Metadata struct {
-				Path       string `json:"path"`
-				MountPoint string `json:"mount_point"`
-			} `json:"metadata"`
-		} `json:"event"`
+		CurrentVersion int `json:"current_version"`
 	} `json:"data"`
 }
 
-// secretPath returns the normalised logical path from the event.
-func (e vaultEvent) secretPath() string {
-	return strings.TrimPrefix(e.Data.Event.Metadata.Path, "/")
+func fetchSecretVersion(cfg config, token, appName string) (int, error) {
+	u := fmt.Sprintf("%s/v1/%s/metadata/%s", cfg.vaultAddr, cfg.vaultMount, appName)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Vault-Token", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("metadata %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var m kvMetadataResp
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return 0, fmt.Errorf("decode metadata: %w", err)
+	}
+	return m.Data.CurrentVersion, nil
 }
 
-// watchEvents opens a WebSocket to Vault's event stream and calls hardRefresh
-// for every write event whose path matches an entry in appMapping.
-// Returns when the connection drops so the caller can reconnect.
-func watchEvents(cfg config, token string, appMapping map[string]string) error {
-	u, err := url.Parse(cfg.vaultAddr)
-	if err != nil {
-		return fmt.Errorf("parse vault addr: %w", err)
-	}
-	switch u.Scheme {
-	case "http":
-		u.Scheme = "ws"
-	case "https":
-		u.Scheme = "wss"
-	}
-	// Subscribe to all KV v2 data events (write + patch) via glob.
-	// Comma-separated types in the path are not supported; one pattern per connection.
-	u.Path = "/v1/sys/events/subscribe/kv-v2/data-*"
-	u.RawQuery = "json=true"
-
-	header := http.Header{"X-Vault-Token": {token}}
-	conn, resp, err := websocket.DefaultDialer.Dial(u.String(), header)
-	if err != nil {
-		if resp != nil {
-			return fmt.Errorf("websocket dial (HTTP %d): %w", resp.StatusCode, err)
-		}
-		return fmt.Errorf("websocket dial: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
-	slog.Info("connected to vault event stream", "url", u.String())
-
-	for {
-		_, msg, err := conn.ReadMessage()
+// pollLoop seeds initial versions then polls on cfg.pollInterval, calling
+// hardRefresh for any app whose secret version has incremented.
+// Returns when all apps fail in a single cycle (likely token expiry), so the
+// caller can re-authenticate and restart.
+func pollLoop(cfg config, token string) error {
+	// Seed initial versions to avoid spurious refreshes on startup.
+	versions := make(map[string]int, len(cfg.watchedApps))
+	for _, app := range cfg.watchedApps {
+		v, err := fetchSecretVersion(cfg, token, app)
 		if err != nil {
-			return fmt.Errorf("websocket read: %w", err)
-		}
-
-		var ev vaultEvent
-		if err := json.Unmarshal(msg, &ev); err != nil {
-			slog.Warn("failed to parse event", "error", err)
+			slog.Warn("could not seed version", "app", app, "error", err)
 			continue
 		}
+		versions[app] = v
+	}
+	slog.Info("polling vault kv metadata", "apps", len(cfg.watchedApps), "interval", cfg.pollInterval)
 
-		path := ev.secretPath()
-		if path == "" {
-			continue
-		}
-		slog.Debug("event received", "type", ev.Type, "path", path)
+	ticker := time.NewTicker(cfg.pollInterval)
+	defer ticker.Stop()
 
-		appName, ok := appMapping[path]
-		if !ok {
-			continue
+	for range ticker.C {
+		failures := 0
+		for _, app := range cfg.watchedApps {
+			v, err := fetchSecretVersion(cfg, token, app)
+			if err != nil {
+				slog.Warn("fetch version failed", "app", app, "error", err)
+				failures++
+				continue
+			}
+			prev, seeded := versions[app]
+			if !seeded {
+				versions[app] = v
+				continue
+			}
+			if v == prev {
+				continue
+			}
+			slog.Info("secret version changed", "app", app, "old_version", prev, "new_version", v)
+			if err := hardRefresh(cfg, app); err != nil {
+				slog.Error("hard refresh failed", "app", app, "error", err)
+			} else {
+				versions[app] = v
+			}
 		}
-		slog.Info("matched app, requesting hard refresh", "app", appName)
-		if err := hardRefresh(cfg, appName); err != nil {
-			slog.Error("hard refresh failed", "app", appName, "error", err)
+		if failures == len(cfg.watchedApps) && len(cfg.watchedApps) > 0 {
+			return fmt.Errorf("all apps unreachable, re-authenticating")
 		}
 	}
+	return nil
 }
 
 // ── ArgoCD hard refresh via K8s annotation patch ──────────────────────────────
@@ -273,7 +281,7 @@ func hardRefresh(cfg config, appName string) error {
 
 // ── Main run loop ─────────────────────────────────────────────────────────────
 
-func run() error {
+func run() {
 	cfg := loadConfig()
 	slog.Info("starting vault-argocd-watcher",
 		"vault_addr", cfg.vaultAddr,
@@ -281,46 +289,23 @@ func run() error {
 		"vault_role", cfg.vaultRole,
 		"argocd_namespace", cfg.argoNamespace,
 		"watched_apps", len(cfg.watchedApps),
+		"poll_interval", cfg.pollInterval,
 	)
 
-	// Build path → app name mapping: ixo_core/data/{app-name} → {app-name}
-	appMapping := make(map[string]string, len(cfg.watchedApps))
-	for _, name := range cfg.watchedApps {
-		appMapping[cfg.vaultMount+"/data/"+name] = name
-	}
-
-	// Initial Vault authentication.
-	token, lease, err := vaultLogin(cfg)
-	if err != nil {
-		return fmt.Errorf("initial vault login: %w", err)
-	}
-	slog.Info("authenticated to vault", "lease_seconds", lease)
-	scheduleTokenRenewal(cfg, token, lease)
-
-	// Reconnect loop with exponential backoff.
-	const (
-		minBackoff = 5 * time.Second
-		maxBackoff = 2 * time.Minute
-	)
-	backoff := minBackoff
-
+	const retryBackoff = 10 * time.Second
 	for {
-		if err := watchEvents(cfg, token, appMapping); err != nil {
-			slog.Warn("websocket disconnected, reconnecting", "error", err, "backoff", backoff)
-			time.Sleep(backoff)
-			if backoff < maxBackoff {
-				backoff *= 2
-			}
+		token, lease, err := vaultLogin(cfg)
+		if err != nil {
+			slog.Error("vault login failed", "error", err, "retry_in", retryBackoff)
+			time.Sleep(retryBackoff)
+			continue
+		}
+		slog.Info("authenticated to vault", "lease_seconds", lease)
+		scheduleTokenRenewal(cfg, token, lease)
 
-			// Re-authenticate in case the token expired while disconnected.
-			token, lease, err = vaultLogin(cfg)
-			if err != nil {
-				slog.Error("re-authentication failed", "error", err)
-				continue
-			}
-			slog.Info("re-authenticated to vault", "lease_seconds", lease)
-			scheduleTokenRenewal(cfg, token, lease)
-			backoff = minBackoff
+		if err := pollLoop(cfg, token); err != nil {
+			slog.Warn("poll loop stopped", "error", err, "retry_in", retryBackoff)
+			time.Sleep(retryBackoff)
 		}
 	}
 }
@@ -345,8 +330,5 @@ func mustEnv(key string) string {
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-	if err := run(); err != nil {
-		slog.Error("fatal", "error", err)
-		os.Exit(1)
-	}
+	run()
 }
