@@ -125,7 +125,7 @@ func vaultRenewSelf(cfg config, token string) error {
 	return nil
 }
 
-func scheduleTokenRenewal(cfg config, token string, leaseSecs int) {
+func scheduleTokenRenewal(ctx context.Context, cfg config, token string, leaseSecs int) {
 	if leaseSecs <= 0 {
 		return
 	}
@@ -134,11 +134,16 @@ func scheduleTokenRenewal(cfg config, token string, leaseSecs int) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for range ticker.C {
-			if err := vaultRenewSelf(cfg, token); err != nil {
-				slog.Warn("token renewal failed", "error", err)
-			} else {
-				slog.Info("vault token renewed", "next_in", interval)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := vaultRenewSelf(cfg, token); err != nil {
+					slog.Warn("token renewal failed", "error", err)
+				} else {
+					slog.Info("vault token renewed", "next_in", interval.String())
+				}
 			}
 		}
 	}()
@@ -190,7 +195,7 @@ func pollLoop(cfg config, token string) error {
 		}
 		versions[app] = v
 	}
-	slog.Info("polling vault kv metadata", "apps", len(cfg.watchedApps), "interval", cfg.pollInterval)
+	slog.Info("polling vault kv metadata", "apps", len(cfg.watchedApps), "interval", cfg.pollInterval.String())
 
 	ticker := time.NewTicker(cfg.pollInterval)
 	defer ticker.Stop()
@@ -289,10 +294,11 @@ func run() {
 		"vault_role", cfg.vaultRole,
 		"argocd_namespace", cfg.argoNamespace,
 		"watched_apps", len(cfg.watchedApps),
-		"poll_interval", cfg.pollInterval,
+		"poll_interval", cfg.pollInterval.String(),
 	)
 
 	const retryBackoff = 10 * time.Second
+	cancelRenewal := func() {}
 	for {
 		token, lease, err := vaultLogin(cfg)
 		if err != nil {
@@ -301,7 +307,11 @@ func run() {
 			continue
 		}
 		slog.Info("authenticated to vault", "lease_seconds", lease)
-		scheduleTokenRenewal(cfg, token, lease)
+
+		cancelRenewal() // stop the previous renewal goroutine before starting a new one
+		var renewCtx context.Context
+		renewCtx, cancelRenewal = context.WithCancel(context.Background())
+		scheduleTokenRenewal(renewCtx, cfg, token, lease)
 
 		if err := pollLoop(cfg, token); err != nil {
 			slog.Warn("poll loop stopped", "error", err, "retry_in", retryBackoff)
